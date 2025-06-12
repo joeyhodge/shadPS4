@@ -26,6 +26,8 @@ using Shader::LogicalStage;
 using Shader::Stage;
 using Shader::VsOutput;
 
+constexpr static auto SpirvVersion1_6 = 0x00010600U;
+
 constexpr static std::array DescriptorHeapSizes = {
     vk::DescriptorPoolSize{vk::DescriptorType::eUniformBuffer, 8192},
     vk::DescriptorPoolSize{vk::DescriptorType::eStorageBuffer, 1024},
@@ -123,7 +125,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
         info.vs_info.emulate_depth_negative_one_to_one =
             !instance.IsDepthClipControlSupported() &&
             regs.clipper_control.clip_space == Liverpool::ClipSpace::MinusWToW;
-        info.vs_info.clip_disable = graphics_key.clip_disable;
+        info.vs_info.clip_disable = regs.IsClipDisabled();
         if (l_stage == LogicalStage::TessellationEval) {
             info.vs_info.tess_type = regs.tess_config.type;
             info.vs_info.tess_topology = regs.tess_config.topology;
@@ -144,6 +146,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
         }
         gs_info.in_vertex_data_size = regs.vgt_esgs_ring_itemsize;
         gs_info.out_vertex_data_size = regs.vgt_gs_vert_itemsize[0];
+        gs_info.mode = regs.vgt_gs_mode.mode;
         const auto params_vc = Liverpool::GetParams(regs.vs_program);
         gs_info.vs_copy = params_vc.code;
         gs_info.vs_copy_hash = params_vc.hash;
@@ -156,6 +159,15 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
         info.fs_info.addr_flags = regs.ps_input_addr;
         const auto& ps_inputs = regs.ps_inputs;
         info.fs_info.num_inputs = regs.num_interp;
+        const auto& cb0_blend = regs.blend_control[0];
+        info.fs_info.dual_source_blending =
+            LiverpoolToVK::IsDualSourceBlendFactor(cb0_blend.color_dst_factor) ||
+            LiverpoolToVK::IsDualSourceBlendFactor(cb0_blend.color_src_factor);
+        if (cb0_blend.separate_alpha_blend) {
+            info.fs_info.dual_source_blending |=
+                LiverpoolToVK::IsDualSourceBlendFactor(cb0_blend.alpha_dst_factor) ||
+                LiverpoolToVK::IsDualSourceBlendFactor(cb0_blend.alpha_src_factor);
+        }
         for (u32 i = 0; i < regs.num_interp; i++) {
             info.fs_info.inputs[i] = {
                 .param_index = u8(ps_inputs[i].input_offset.Value()),
@@ -192,16 +204,21 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
       desc_heap{instance, scheduler.GetMasterSemaphore(), DescriptorHeapSizes} {
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
-        .supported_spirv = instance.ApiVersion() >= VK_API_VERSION_1_3 ? 0x00010600U : 0x00010500U,
+        .supported_spirv = SpirvVersion1_6,
         .subgroup_size = instance.SubgroupSize(),
+        .support_float64 = instance.IsShaderFloat64Supported(),
         .support_fp32_denorm_preserve = bool(vk12_props.shaderDenormPreserveFloat32),
         .support_fp32_denorm_flush = bool(vk12_props.shaderDenormFlushToZeroFloat32),
         .support_fp32_round_to_zero = bool(vk12_props.shaderRoundingModeRTZFloat32),
-        .support_explicit_workgroup_layout = true,
         .support_legacy_vertex_attributes = instance_.IsLegacyVertexAttributesSupported(),
         .supports_image_load_store_lod = instance_.IsImageLoadStoreLodSupported(),
         .supports_native_cube_calc = instance_.IsAmdGcnShaderSupported(),
-        .supports_robust_buffer_access = instance_.IsRobustBufferAccess2Supported(),
+        .supports_trinary_minmax = instance_.IsAmdShaderTrinaryMinMaxSupported(),
+        // TODO: Emitted bounds checks cause problems with phi control flow; needs to be fixed.
+        .supports_robust_buffer_access = true, // instance_.IsRobustBufferAccess2Supported(),
+        .supports_image_fp32_atomic_min_max = instance_.IsShaderAtomicFloatImage32MinMaxSupported(),
+        .supports_workgroup_explicit_memory_layout =
+            instance_.IsWorkgroupMemoryExplicitLayoutSupported(),
         .needs_manual_interpolation = instance.IsFragmentShaderBarycentricSupported() &&
                                       instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
@@ -266,16 +283,6 @@ bool PipelineCache::RefreshGraphicsKey() {
     auto& regs = liverpool->regs;
     auto& key = graphics_key;
 
-    key.clip_disable =
-        regs.clipper_control.clip_disable || regs.primitive_type == AmdGpu::PrimitiveType::RectList;
-    key.depth_test_enable = regs.depth_control.depth_enable;
-    key.depth_write_enable =
-        regs.depth_control.depth_write_enable && !regs.depth_render_control.depth_clear_enable;
-    key.depth_bounds_test_enable = regs.depth_control.depth_bounds_enable;
-    key.depth_bias_enable = regs.polygon_control.NeedsBias();
-    key.depth_compare_op = LiverpoolToVK::CompareOp(regs.depth_control.depth_func);
-    key.stencil_test_enable = regs.depth_control.stencil_enable;
-
     const auto depth_format = instance.GetSupportedFormat(
         LiverpoolToVK::DepthFormat(regs.depth_buffer.z_info.format,
                                    regs.depth_buffer.stencil_info.format),
@@ -284,22 +291,16 @@ bool PipelineCache::RefreshGraphicsKey() {
         key.depth_format = depth_format;
     } else {
         key.depth_format = vk::Format::eUndefined;
-        key.depth_test_enable = false;
     }
     if (regs.depth_buffer.StencilValid()) {
         key.stencil_format = depth_format;
     } else {
         key.stencil_format = vk::Format::eUndefined;
-        key.stencil_test_enable = false;
     }
 
     key.prim_type = regs.primitive_type;
-    key.enable_primitive_restart = regs.enable_primitive_restart & 1;
-    key.primitive_restart_index = regs.primitive_restart_index;
     key.polygon_mode = regs.polygon_control.PolyMode();
-    key.cull_mode = regs.polygon_control.CullingMode();
     key.clip_space = regs.clipper_control.clip_space;
-    key.front_face = regs.polygon_control.front_face;
     key.num_samples = regs.NumSamples();
 
     const bool skip_cb_binding =

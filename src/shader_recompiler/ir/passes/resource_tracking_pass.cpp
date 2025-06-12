@@ -17,6 +17,8 @@ using SharpLocation = u32;
 bool IsBufferAtomic(const IR::Inst& inst) {
     switch (inst.GetOpcode()) {
     case IR::Opcode::BufferAtomicIAdd32:
+    case IR::Opcode::BufferAtomicIAdd64:
+    case IR::Opcode::BufferAtomicISub32:
     case IR::Opcode::BufferAtomicSMin32:
     case IR::Opcode::BufferAtomicUMin32:
     case IR::Opcode::BufferAtomicSMax32:
@@ -27,6 +29,7 @@ bool IsBufferAtomic(const IR::Inst& inst) {
     case IR::Opcode::BufferAtomicOr32:
     case IR::Opcode::BufferAtomicXor32:
     case IR::Opcode::BufferAtomicSwap32:
+    case IR::Opcode::BufferAtomicCmpSwap32:
         return true;
     default:
         return false;
@@ -41,6 +44,7 @@ bool IsBufferStore(const IR::Inst& inst) {
     case IR::Opcode::StoreBufferU32x2:
     case IR::Opcode::StoreBufferU32x3:
     case IR::Opcode::StoreBufferU32x4:
+    case IR::Opcode::StoreBufferU64:
     case IR::Opcode::StoreBufferF32:
     case IR::Opcode::StoreBufferF32x2:
     case IR::Opcode::StoreBufferF32x3:
@@ -60,6 +64,7 @@ bool IsBufferInstruction(const IR::Inst& inst) {
     case IR::Opcode::LoadBufferU32x2:
     case IR::Opcode::LoadBufferU32x3:
     case IR::Opcode::LoadBufferU32x4:
+    case IR::Opcode::LoadBufferU64:
     case IR::Opcode::LoadBufferF32:
     case IR::Opcode::LoadBufferF32x2:
     case IR::Opcode::LoadBufferF32x3:
@@ -85,6 +90,10 @@ IR::Type BufferDataType(const IR::Inst& inst, AmdGpu::NumberFormat num_format) {
     case IR::Opcode::LoadBufferU16:
     case IR::Opcode::StoreBufferU16:
         return IR::Type::U16;
+    case IR::Opcode::LoadBufferU64:
+    case IR::Opcode::StoreBufferU64:
+    case IR::Opcode::BufferAtomicIAdd64:
+        return IR::Type::U64;
     case IR::Opcode::LoadBufferFormatF32:
     case IR::Opcode::StoreBufferFormatF32:
         // Formatted buffer loads can use a variety of types.
@@ -101,6 +110,8 @@ bool IsImageAtomicInstruction(const IR::Inst& inst) {
     case IR::Opcode::ImageAtomicUMin32:
     case IR::Opcode::ImageAtomicSMax32:
     case IR::Opcode::ImageAtomicUMax32:
+    case IR::Opcode::ImageAtomicFMax32:
+    case IR::Opcode::ImageAtomicFMin32:
     case IR::Opcode::ImageAtomicInc32:
     case IR::Opcode::ImageAtomicDec32:
     case IR::Opcode::ImageAtomicAnd32:
@@ -235,9 +246,12 @@ std::pair<const IR::Inst*, bool> TryDisableAnisoLod0(const IR::Inst* inst) {
     return {prod2, true};
 }
 
-SharpLocation TrackSharp(const IR::Inst* inst, const Shader::Info& info) {
+SharpLocation AttemptTrackSharp(const IR::Inst* inst, auto& visited_insts) {
     // Search until we find a potential sharp source.
-    const auto pred = [](const IR::Inst* inst) -> std::optional<const IR::Inst*> {
+    const auto pred = [&visited_insts](const IR::Inst* inst) -> std::optional<const IR::Inst*> {
+        if (std::ranges::find(visited_insts, inst) != visited_insts.end()) {
+            return std::nullopt;
+        }
         if (inst->GetOpcode() == IR::Opcode::GetUserData ||
             inst->GetOpcode() == IR::Opcode::ReadConst) {
             return inst;
@@ -247,6 +261,7 @@ SharpLocation TrackSharp(const IR::Inst* inst, const Shader::Info& info) {
     const auto result = IR::BreadthFirstSearch(inst, pred);
     ASSERT_MSG(result, "Unable to track sharp source");
     inst = result.value();
+    visited_insts.emplace_back(inst);
     if (inst->GetOpcode() == IR::Opcode::GetUserData) {
         return static_cast<u32>(inst->Arg(0).ScalarReg());
     } else {
@@ -254,6 +269,29 @@ SharpLocation TrackSharp(const IR::Inst* inst, const Shader::Info& info) {
                    "Sharp load not from constant memory");
         return inst->Flags<u32>();
     }
+}
+
+/// Tracks a sharp with validation of the chosen data type.
+template <typename DataType>
+std::pair<SharpLocation, DataType> TrackSharp(const IR::Inst* inst, const Info& info) {
+    boost::container::small_vector<const IR::Inst*, 4> visited_insts{};
+    while (true) {
+        const auto prev_size = visited_insts.size();
+        const auto sharp = AttemptTrackSharp(inst, visited_insts);
+        if (const auto data = info.ReadUdSharp<DataType>(sharp); data.Valid()) {
+            return std::make_pair(sharp, data);
+        }
+        if (prev_size == visited_insts.size()) {
+            // No change in visited instructions, we've run out of paths.
+            UNREACHABLE_MSG("Unable to find valid sharp.");
+        }
+    }
+}
+
+/// Tracks a sharp without data validation.
+SharpLocation TrackSharp(const IR::Inst* inst, const Info& info) {
+    boost::container::static_vector<const IR::Inst*, 1> visited_insts{};
+    return AttemptTrackSharp(inst, visited_insts);
 }
 
 s32 TryHandleInlineCbuf(IR::Inst& inst, Info& info, Descriptors& descriptors,
@@ -293,8 +331,8 @@ void PatchBufferSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors&
     if (binding = TryHandleInlineCbuf(inst, info, descriptors, buffer); binding == -1) {
         IR::Inst* handle = inst.Arg(0).InstRecursive();
         IR::Inst* producer = handle->Arg(0).InstRecursive();
-        const auto sharp = TrackSharp(producer, info);
-        buffer = info.ReadUdSharp<AmdGpu::Buffer>(sharp);
+        SharpLocation sharp;
+        std::tie(sharp, buffer) = TrackSharp<AmdGpu::Buffer>(producer, info);
         binding = descriptors.Add(BufferResource{
             .sharp_idx = sharp,
             .used_types = BufferDataType(inst, buffer.GetNumberFmt()),
@@ -333,6 +371,12 @@ void PatchImageSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors& 
     if (!image.Valid()) {
         LOG_ERROR(Render_Vulkan, "Shader compiled with unbound image!");
         image = AmdGpu::Image::Null();
+    }
+    const auto data_fmt = image.GetDataFmt();
+    if (inst_info.is_depth && data_fmt != AmdGpu::DataFormat::Format16 &&
+        data_fmt != AmdGpu::DataFormat::Format32) {
+        LOG_ERROR(Render_Vulkan, "Shader compiled using non-depth image with depth instruction!");
+        image = AmdGpu::Image::NullDepth();
     }
     ASSERT(image.GetType() != AmdGpu::ImageType::Invalid);
     const bool is_written = inst.GetOpcode() == IR::Opcode::ImageWrite;
@@ -376,6 +420,7 @@ void PatchImageSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors& 
         .is_atomic = IsImageAtomicInstruction(inst),
         .is_array = bool(inst_info.is_array),
         .is_written = is_written,
+        .is_r128 = bool(inst_info.is_r128),
     });
 
     IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};

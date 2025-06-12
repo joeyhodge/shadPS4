@@ -156,6 +156,18 @@ vk::CullModeFlags CullMode(Liverpool::CullMode mode) {
     }
 }
 
+vk::FrontFace FrontFace(Liverpool::FrontFace face) {
+    switch (face) {
+    case Liverpool::FrontFace::Clockwise:
+        return vk::FrontFace::eClockwise;
+    case Liverpool::FrontFace::CounterClockwise:
+        return vk::FrontFace::eCounterClockwise;
+    default:
+        UNREACHABLE();
+        return vk::FrontFace::eClockwise;
+    }
+}
+
 vk::BlendFactor BlendFactor(Liverpool::BlendControl::BlendFactor factor) {
     using BlendFactor = Liverpool::BlendControl::BlendFactor;
     switch (factor) {
@@ -199,6 +211,19 @@ vk::BlendFactor BlendFactor(Liverpool::BlendControl::BlendFactor factor) {
         return vk::BlendFactor::eOneMinusConstantAlpha;
     default:
         UNREACHABLE();
+    }
+}
+
+bool IsDualSourceBlendFactor(Liverpool::BlendControl::BlendFactor factor) {
+    using BlendFactor = Liverpool::BlendControl::BlendFactor;
+    switch (factor) {
+    case BlendFactor::Src1Color:
+    case BlendFactor::Src1Alpha:
+    case BlendFactor::InvSrc1Color:
+    case BlendFactor::InvSrc1Alpha:
+        return true;
+    default:
+        return false;
     }
 }
 
