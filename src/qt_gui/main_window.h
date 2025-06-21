@@ -49,7 +49,7 @@ private Q_SLOTS:
     void ShowGameList();
     void RefreshGameTable();
     void HandleResize(QResizeEvent* event);
-    void OnLanguageChanged(const std::string& locale);
+    void OnLanguageChanged(const QString& locale);
     void toggleLabelsUnderIcons();
 
 private:
