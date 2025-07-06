@@ -20,10 +20,14 @@ bool IsBufferAtomic(const IR::Inst& inst) {
     case IR::Opcode::BufferAtomicIAdd64:
     case IR::Opcode::BufferAtomicISub32:
     case IR::Opcode::BufferAtomicSMin32:
+    case IR::Opcode::BufferAtomicSMin64:
     case IR::Opcode::BufferAtomicUMin32:
+    case IR::Opcode::BufferAtomicUMin64:
     case IR::Opcode::BufferAtomicFMin32:
     case IR::Opcode::BufferAtomicSMax32:
+    case IR::Opcode::BufferAtomicSMax64:
     case IR::Opcode::BufferAtomicUMax32:
+    case IR::Opcode::BufferAtomicUMax64:
     case IR::Opcode::BufferAtomicFMax32:
     case IR::Opcode::BufferAtomicInc32:
     case IR::Opcode::BufferAtomicDec32:
@@ -95,6 +99,10 @@ IR::Type BufferDataType(const IR::Inst& inst, AmdGpu::NumberFormat num_format) {
     case IR::Opcode::LoadBufferU64:
     case IR::Opcode::StoreBufferU64:
     case IR::Opcode::BufferAtomicIAdd64:
+    case IR::Opcode::BufferAtomicSMax64:
+    case IR::Opcode::BufferAtomicSMin64:
+    case IR::Opcode::BufferAtomicUMax64:
+    case IR::Opcode::BufferAtomicUMin64:
         return IR::Type::U64;
     case IR::Opcode::LoadBufferFormatF32:
     case IR::Opcode::StoreBufferFormatF32:
@@ -102,6 +110,53 @@ IR::Type BufferDataType(const IR::Inst& inst, AmdGpu::NumberFormat num_format) {
         return IR::Type::U32 | IR::Type::F32 | IR::Type::U16 | IR::Type::U8;
     default:
         return IR::Type::U32;
+    }
+}
+
+u32 BufferAddressShift(const IR::Inst& inst, AmdGpu::DataFormat data_format) {
+    switch (inst.GetOpcode()) {
+    case IR::Opcode::LoadBufferU8:
+    case IR::Opcode::StoreBufferU8:
+        return 0;
+    case IR::Opcode::LoadBufferU16:
+    case IR::Opcode::StoreBufferU16:
+        return 1;
+    case IR::Opcode::LoadBufferU64:
+    case IR::Opcode::StoreBufferU64:
+    case IR::Opcode::BufferAtomicIAdd64:
+    case IR::Opcode::BufferAtomicSMax64:
+    case IR::Opcode::BufferAtomicSMin64:
+    case IR::Opcode::BufferAtomicUMax64:
+    case IR::Opcode::BufferAtomicUMin64:
+        return 3;
+    case IR::Opcode::LoadBufferFormatF32:
+    case IR::Opcode::StoreBufferFormatF32: {
+        switch (data_format) {
+        case AmdGpu::DataFormat::Format8:
+            return 0;
+        case AmdGpu::DataFormat::Format8_8:
+        case AmdGpu::DataFormat::Format16:
+            return 1;
+        case AmdGpu::DataFormat::Format8_8_8_8:
+        case AmdGpu::DataFormat::Format16_16:
+        case AmdGpu::DataFormat::Format10_11_11:
+        case AmdGpu::DataFormat::Format2_10_10_10:
+        case AmdGpu::DataFormat::Format16_16_16_16:
+        case AmdGpu::DataFormat::Format32:
+        case AmdGpu::DataFormat::Format32_32:
+        case AmdGpu::DataFormat::Format32_32_32:
+        case AmdGpu::DataFormat::Format32_32_32_32:
+            return 2;
+        default:
+            return 0;
+        }
+        break;
+    }
+    case IR::Opcode::ReadConstBuffer:
+        // Provided address is already in dwords
+        return 0;
+    default:
+        return 2;
     }
 }
 
@@ -496,6 +551,22 @@ void PatchDataRingAccess(IR::Block& block, IR::Inst& inst, Info& info, Descripto
 IR::U32 CalculateBufferAddress(IR::IREmitter& ir, const IR::Inst& inst, const Info& info,
                                const AmdGpu::Buffer& buffer, u32 stride) {
     const auto inst_info = inst.Flags<IR::BufferInstInfo>();
+    const u32 inst_offset = inst_info.inst_offset.Value();
+    const auto is_inst_typed = inst_info.inst_data_fmt != AmdGpu::DataFormat::FormatInvalid;
+    const auto data_format = is_inst_typed
+                                 ? AmdGpu::RemapDataFormat(inst_info.inst_data_fmt.Value())
+                                 : buffer.GetDataFmt();
+    const u32 shift = BufferAddressShift(inst, data_format);
+    const u32 mask = (1 << shift) - 1;
+
+    // If address calculation is of the form "index * const_stride + offset" with offset constant
+    // and both const_stride and offset are divisible with the element size, apply shift directly.
+    if (inst_info.index_enable && !inst_info.offset_enable && !buffer.swizzle_enable &&
+        !buffer.add_tid_enable && (stride & mask) == 0 && (inst_offset & mask) == 0) {
+        // buffer_offset = index * (const_stride >> shift) + (inst_offset >> shift)
+        const IR::U32 index = IR::U32{inst.Arg(1)};
+        return ir.IAdd(ir.IMul(index, ir.Imm32(stride >> shift)), ir.Imm32(inst_offset >> shift));
+    }
 
     // index = (inst_idxen ? vgpr_index : 0) + (const_add_tid_enable ? thread_id[5:0] : 0)
     IR::U32 index = ir.Imm32(0U);
@@ -512,7 +583,7 @@ IR::U32 CalculateBufferAddress(IR::IREmitter& ir, const IR::Inst& inst, const In
         index = ir.IAdd(index, thread_id);
     }
     // offset = (inst_offen ? vgpr_offset : 0) + inst_offset
-    IR::U32 offset = ir.Imm32(inst_info.inst_offset.Value());
+    IR::U32 offset = ir.Imm32(inst_offset);
     if (inst_info.offset_enable) {
         const IR::U32 vgpr_offset = inst_info.index_enable
                                         ? IR::U32{ir.CompositeExtract(inst.Arg(1), 1)}
@@ -544,6 +615,9 @@ IR::U32 CalculateBufferAddress(IR::IREmitter& ir, const IR::Inst& inst, const In
     } else {
         // buffer_offset = index * const_stride + offset
         buffer_offset = ir.IAdd(ir.IMul(index, const_stride), offset);
+    }
+    if (shift != 0) {
+        buffer_offset = ir.ShiftRightLogical(buffer_offset, ir.Imm32(shift));
     }
     return buffer_offset;
 }

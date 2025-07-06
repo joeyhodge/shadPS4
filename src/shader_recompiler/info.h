@@ -225,6 +225,8 @@ struct Info {
     bool uses_fp64{};
     bool uses_pack_10_11_11{};
     bool uses_unpack_10_11_11{};
+    bool uses_buffer_int64_atomics{};
+    bool uses_shared_int64_atomics{};
     bool stores_tess_level_outer{};
     bool stores_tess_level_inner{};
     bool translation_failed{};
@@ -238,7 +240,7 @@ struct Info {
         Dynamic = 1 << 1,
     };
     ReadConstType readconst_types{};
-    IR::Type dma_types{IR::Type::Void};
+    bool uses_dma{false};
 
     explicit Info(Stage stage_, LogicalStage l_stage_, ShaderParams params)
         : stage{stage_}, l_stage{l_stage_}, pgm_hash{params.hash}, pgm_base{params.Base()},
